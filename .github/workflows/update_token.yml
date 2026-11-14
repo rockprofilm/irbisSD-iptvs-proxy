@@ -25,4 +25,5 @@ jobs:
       - name: Run script
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python update.py
