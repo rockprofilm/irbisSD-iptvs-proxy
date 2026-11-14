@@ -1,17 +1,23 @@
 import os
 import re
+import threading
 import requests
 
-from flask import Flask, Response, abort
+from urllib.parse import urljoin
+from flask import Flask, Response, abort, request
 
 app = Flask(__name__)
 
-SOURCE_URL = os.environ.get("SOURCE_URL")
+API_ACCESS_TOKEN = os.environ.get("API_ACCESS_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "5858")
 
-if not SOURCE_URL:
-    raise RuntimeError("SOURCE_URL environment variable is missing")
+if not API_ACCESS_TOKEN:
+    raise RuntimeError("API_ACCESS_TOKEN environment variable is missing")
 
-BASE_URL = SOURCE_URL.rsplit("/", 1)[0]
+API_URL = (
+    f"https://birgetv.platform24.tv"
+    f"/v2/channels/{CHANNEL_ID}/stream"
+)
 
 session = requests.Session()
 
@@ -19,6 +25,76 @@ session.headers.update({
     "User-Agent": "VLC/3.0.21 LibVLC/3.0.21",
     "Accept": "*/*",
 })
+
+CURRENT_BASE_URL = None
+base_lock = threading.Lock()
+
+
+def get_master_url():
+    response = session.get(
+        API_URL,
+        params={
+            "access_token": API_ACCESS_TOKEN,
+            "force_https": "true"
+        },
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+    master_url = data.get("hls_mbr")
+
+    if not master_url:
+        raise RuntimeError("API response does not contain hls_mbr")
+
+    if not master_url.startswith(
+        "https://stream.qfilm.platform24.tv/mbrjwt/"
+    ):
+        raise RuntimeError("Unexpected hls_mbr URL")
+
+    return master_url
+
+
+def get_media_playlist():
+    global CURRENT_BASE_URL
+
+    master_url = get_master_url()
+
+    master_response = session.get(
+        master_url,
+        timeout=15
+    )
+
+    master_response.raise_for_status()
+
+    variant_uri = None
+
+    for line in master_response.text.splitlines():
+        line = line.strip()
+
+        if line and not line.startswith("#"):
+            variant_uri = line
+            break
+
+    if not variant_uri:
+        raise RuntimeError("Master Playlist has no variant URI")
+
+    media_url = urljoin(master_url, variant_uri)
+
+    base_url = urljoin(media_url, "./").rstrip("/")
+
+    media_response = session.get(
+        media_url,
+        timeout=15
+    )
+
+    media_response.raise_for_status()
+
+    with base_lock:
+        CURRENT_BASE_URL = base_url
+
+    return media_response.text
 
 
 @app.route("/")
@@ -30,42 +106,35 @@ def index():
 def health():
     return {
         "status": "online",
-        "channel": "Irbis TV"
+        "channel": CHANNEL_ID
     }, 200
 
 
 @app.route("/irbis.m3u8")
 def playlist():
-
     try:
-        response = session.get(
-            SOURCE_URL,
-            timeout=15
-        )
+        playlist_text = get_media_playlist()
 
-        response.raise_for_status()
-
-        lines = response.text.splitlines()
         output = []
 
-        for line in lines:
-
+        for line in playlist_text.splitlines():
             line = line.strip()
 
             if line and not line.startswith("#"):
 
-                segment_match = re.fullmatch(
-                    r"0/(\d+\.ts)",
+                match = re.fullmatch(
+                    r"0/(\d+\.ts)(\?.*)?",
                     line
                 )
 
-                if not segment_match:
+                if not match:
                     abort(502)
 
-                segment_name = segment_match.group(1)
+                segment_name = match.group(1)
+                query = match.group(2) or ""
 
                 output.append(
-                    f"/irbis/{segment_name}"
+                    f"/irbis/{segment_name}{query}"
                 )
 
             else:
@@ -82,25 +151,64 @@ def playlist():
     except requests.RequestException:
         abort(502)
 
+    except (ValueError, KeyError, RuntimeError):
+        abort(502)
+
 
 @app.route("/irbis/<segment>")
 def segment(segment):
+    global CURRENT_BASE_URL
 
     if not re.fullmatch(r"\d+\.ts", segment):
         abort(404)
 
-    url = f"{BASE_URL}/0/{segment}"
+    with base_lock:
+        base_url = CURRENT_BASE_URL
 
     try:
+        if not base_url:
+            get_media_playlist()
+
+            with base_lock:
+                base_url = CURRENT_BASE_URL
+
+        url = f"{base_url}/0/{segment}"
+
+        query = request.query_string.decode("ascii")
+
+        if query:
+            url += f"?{query}"
+
         upstream = session.get(
             url,
             stream=True,
             timeout=(10, 30)
         )
 
-        if upstream.status_code != 200:
+        # Если JWT истёк — получаем новый через API
+        if upstream.status_code in (401, 403):
             upstream.close()
-            abort(upstream.status_code)
+
+            get_media_playlist()
+
+            with base_lock:
+                base_url = CURRENT_BASE_URL
+
+            url = f"{base_url}/0/{segment}"
+
+            if query:
+                url += f"?{query}"
+
+            upstream = session.get(
+                url,
+                stream=True,
+                timeout=(10, 30)
+            )
+
+        if upstream.status_code != 200:
+            status = upstream.status_code
+            upstream.close()
+            abort(status)
 
         def generate():
             try:
@@ -125,7 +233,6 @@ def segment(segment):
 
 
 if __name__ == "__main__":
-
     port = int(os.environ.get("PORT", 10000))
 
     app.run(
