@@ -230,7 +230,14 @@ def segment(segment):
 
     except requests.RequestException:
         abort(502)
-
+        
+@app.route("/debug")
+def debug():
+    app.logger.warning("DEBUG ROUTE WAS CALLED")
+    return {
+        "status": "ok",
+        "message": "Flask handler reached"
+    }, 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
