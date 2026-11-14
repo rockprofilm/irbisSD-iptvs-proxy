@@ -3,14 +3,12 @@ import sys
 import time
 import requests
 
-print("[*] Старт скрипта update.py")
+print("[*] Старт обновленного скрипта update.py")
 render_url = os.environ.get("RENDER_URL")
 target_page = "https://app.birge.tv/channels/1/irbis-tv"
 
 print(f"[*] Целевой адрес: {target_page}")
-print(
-    f"[*] RENDER_URL: {render_url if render_url else 'НЕ ЗАДАН (проверьте Secrets)'}"
-)
+print(f"[*] RENDER_URL: {render_url if render_url else 'НЕ ЗАДАН'}")
 
 captured_hls_mbr = None
 
@@ -19,7 +17,6 @@ try:
 
   print("[*] Инициализация Playwright...")
   with sync_playwright() as p:
-    print("[*] Запуск Chromium в headless-режиме...")
     browser = p.chromium.launch(
         headless=True,
         args=[
@@ -40,59 +37,82 @@ try:
     def handle_response(response):
       global captured_hls_mbr
       url = response.url
-      if (
-          "stream" in url
-          or "hls_mbr" in url
-          or "channels/5858" in url
-          or "playlist" in url
+
+      # Игнорируем статику (картинки, CSS, шрифты)
+      if any(
+          ext in url
+          for ext in [".png", ".jpg", ".jpeg", ".css", ".woff", ".js", ".svg"]
       ):
-        try:
+        return
+
+      # Проверяем все ответы, похожие на API или потоковые ссылки
+      try:
+        # Вариант 1: Попытка разбора JSON-ответа
+        if "application/json" in response.headers.get("content-type", ""):
           data = response.json()
-          hls_mbr = (
-              data.get("data", {}).get("hls_mbr")
-              or data.get("hls_mbr")
-              or data.get("url")
+          # Ищем ключи hls_mbr, hls, stream, url в любых вложенных словарях
+          possible_url = None
+          if isinstance(data, dict):
+            # Проход по типовым структурам API
+            d = data.get("data", data)
+            if isinstance(d, dict):
+              possible_url = (
+                  d.get("hls_mbr")
+                  or d.get("hls")
+                  or d.get("stream")
+                  or d.get("url")
+              )
+
+          if possible_url and "http" in str(possible_url):
+            captured_hls_mbr = possible_url
+            print(f"[+] [JSON] Перехвачена ссылка: {captured_hls_mbr[:80]}...")
+
+        # Вариант 2: Прямой перехват запроса/редиректа с расширением .m3u8
+        elif ".m3u8" in url and not captured_hls_mbr:
+          captured_hls_mbr = url
+          print(
+              f"[+] [Direct M3U8] Перехвачена ссылка:"
+              f" {captured_hls_mbr[:80]}..."
           )
-          if hls_mbr and "http" in hls_mbr:
-            captured_hls_mbr = hls_mbr
-            print(f"[+] Перехвачена ссылка: {captured_hls_mbr[:70]}...")
-        except Exception:
-          pass
+
+      except Exception:
+        pass
 
     page.on("response", handle_response)
 
     print(f"[*] Переходим на страницу {target_page}...")
-    page.goto(target_page, timeout=60000, wait_until="domcontentloaded")
+    page.goto(target_page, timeout=60000, wait_until="networkidle")
 
-    print("[*] Ожидаем загрузку элементов (10 сек)...")
-    time.sleep(10)
+    print("[*] Ожидаем инициализации плеера (8 сек)...")
+    time.sleep(8)
 
-    # Кликом активируем плеер на случай автопаузы
-    try:
-      print("[*] Имитируем клик по плееру для запуска вещания...")
-      page.click("body", timeout=3000)
-      time.sleep(5)
-    except Exception as e:
-      print(f"[!] Не удалось сделать клик: {e}")
+    # Если ссылка еще не поймана, делаем клики по области плеера
+    if not captured_hls_mbr:
+      try:
+        print("[*] Клик по центру экрана для запуска вещания...")
+        page.mouse.click(640, 360)
+        time.sleep(5)
+      except Exception as e:
+        print(f"[!] Ошибка клика: {e}")
 
     browser.close()
     print("[*] Браузер закрыт.")
 
 except Exception as e:
-  print(f"[!] КРИТИЧЕСКАЯ ОШИБКА PLAYWRIGHT: {e}")
+  print(f"[!] КРИТИЧЕСКАЯ ОШИБКА: {e}")
 
+# Отправка результатов
 if captured_hls_mbr and render_url:
-  print(f"[+] Отправка найденной ссылки на Render ({render_url})...")
+  clean_render_url = render_url.rstrip("/")
+  print(f"[+] Отправка ссылки на Render ({clean_render_url})...")
   try:
     resp = requests.post(
-        f"{render_url.rstrip('/')}/update_link",
+        f"{clean_render_url}/update_link",
         json={"hls_mbr": captured_hls_mbr},
         timeout=15,
     )
     print(f"[+] Ответ Render: {resp.status_code} - {resp.text}")
   except Exception as e:
-    print(f"[!] Ошибка отправки запроса на Render: {e}")
+    print(f"[!] Ошибка запроса к Render: {e}")
 else:
-  print(
-      "[-] ИТОГ: Ссылка не поймана или RENDER_URL не настроен в GitHub Secrets."
-  )
+  print("[-] ИТОГ: Ссылка не поймана или RENDER_URL не настроен.")
