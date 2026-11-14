@@ -2,8 +2,8 @@ name: Update Birge TV Token
 
 on:
   schedule:
-    - cron: '0 */3 * * *' # Запуск каждые 3 часа
-  workflow_dispatch: # Позволяет запустить процесс вручную кнопкой в интерфейсе GitHub
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
 
 jobs:
   update-token:
@@ -22,54 +22,7 @@ jobs:
           pip install playwright requests
           playwright install chromium
 
-      - name: Run token extractor script
+      - name: Run script
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
-        run: |
-          python - <<'EOF'
-          import time
-          import os
-          import requests
-          from playwright.sync_api import sync_playwright
-
-          render_url = os.environ.get("RENDER_URL")
-          target_page = "https://app.birge.tv/channels/1/irbis-tv"
-
-          print("[*] Запуск Playwright в GitHub Actions...")
-          with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-              page = browser.new_page()
-              
-              captured_hls_mbr = None
-
-              def handle_route(route):
-                  nonlocal captured_hls_mbr
-                  url = route.request.url
-                  if "channels/5858/stream" in url:
-                      try:
-                          res = route.fetch()
-                          data = res.json()
-                          hls_mbr = data.get("data", {}).get("hls_mbr")
-                          if hls_mbr:
-                              captured_hls_mbr = hls_mbr
-                      except Exception as e:
-                          print(f"[!] Ошибка перехвата: {e}")
-                  route.continue_()
-
-              page.route("**/*", handle_route)
-
-              try:
-                  page.goto(target_page, timeout=30000, wait_until="networkidle")
-                  time.sleep(5)
-              except Exception as e:
-                  print(f"[!] Ошибка загрузки страницы: {e}")
-              finally:
-                  browser.close()
-
-              if captured_hls_mbr and render_url:
-                  print(f"[+] Ссылка поймана. Отправляем на Render...")
-                  resp = requests.post(f"{render_url}/update_link", json={"hls_mbr": captured_hls_mbr}, timeout=10)
-                  print(f"[+] Ответ Render: {resp.status_code}")
-              else:
-                  print("[-] Не удалось получить ссылку или не задан RENDER_URL.")
-          EOF
+        run: python update.py
