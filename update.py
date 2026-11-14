@@ -1,22 +1,37 @@
+import json
 import os
+import re
 import sys
 import time
 import requests
 
-print("[*] Старт обновленного скрипта update.py")
+print("[*] Старт обновленного скрипта update.py (v3)")
 render_url = os.environ.get("RENDER_URL")
 target_page = "https://app.birge.tv/channels/1/irbis-tv"
 
 print(f"[*] Целевой адрес: {target_page}")
-print(f"[*] RENDER_URL: {render_url if render_url else 'НЕ ЗАДАН'}")
+print(
+    f"[*] RENDER_URL: {render_url if render_url else 'НЕ ЗАДАН (проверьте Secrets)'}"
+)
 
 captured_hls_mbr = None
+all_api_urls = []
+
+
+def extract_m3u8_from_text(text):
+  """Поиск любой ссылки .m3u8 в тексте или JSON"""
+  match = re.search(r"https?://[^\s\"'\\]+\.m3u8[^\s\"'\\]*", text)
+  if match:
+    return match.group(0).replace("\\/", "/")
+  return None
+
 
 try:
   from playwright.sync_api import sync_playwright
 
   print("[*] Инициализация Playwright...")
   with sync_playwright() as p:
+    # Запуск с аргументами, разрешающими автозапуск видео без жестких проверок браузера
     browser = p.chromium.launch(
         headless=True,
         args=[
@@ -24,76 +39,119 @@ try:
             "--disable-setuid-sandbox",
             "--disable-gpu",
             "--disable-dev-shm-usage",
+            "--autoplay-policy=no-user-gesture-required",
+            "--no-first-run",
+            "--use-fake-ui-for-media-stream",
         ],
     )
+
+    # Настраиваем размер экрана как у обычного десктопа
     context = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+            " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
     )
     page = context.new_page()
+
+    def inspect_url_and_body(url, body_text=""):
+      global captured_hls_mbr
+      if captured_hls_mbr:
+        return
+
+      # 1. Прямой поиск .m3u8 в URL
+      if ".m3u8" in url:
+        captured_hls_mbr = url
+        print(f"[+] [Direct M3U8 URL] Найдено: {captured_hls_mbr[:90]}")
+        return
+
+      # 2. Поиск .m3u8 внутри тела ответа
+      found_in_body = extract_m3u8_from_text(body_text)
+      if found_in_body:
+        captured_hls_mbr = found_in_body
+        print(f"[+] [Extracted M3U8 Body] Найдено: {captured_hls_mbr[:90]}")
+        return
 
     def handle_response(response):
       global captured_hls_mbr
       url = response.url
 
-      # Игнорируем статику (картинки, CSS, шрифты)
+      # Фильтруем статические ресурсы
       if any(
           ext in url
-          for ext in [".png", ".jpg", ".jpeg", ".css", ".woff", ".js", ".svg"]
+          for ext in [
+              ".png",
+              ".jpg",
+              ".jpeg",
+              ".css",
+              ".woff",
+              ".svg",
+              ".js",
+              ".ico",
+          ]
       ):
         return
 
-      # Проверяем все ответы, похожие на API или потоковые ссылки
+      all_api_urls.append(f"[{response.status}] {url[:100]}")
+
       try:
-        # Вариант 1: Попытка разбора JSON-ответа
-        if "application/json" in response.headers.get("content-type", ""):
-          data = response.json()
-          # Ищем ключи hls_mbr, hls, stream, url в любых вложенных словарях
-          possible_url = None
-          if isinstance(data, dict):
-            # Проход по типовым структурам API
-            d = data.get("data", data)
-            if isinstance(d, dict):
-              possible_url = (
-                  d.get("hls_mbr")
-                  or d.get("hls")
-                  or d.get("stream")
-                  or d.get("url")
-              )
-
-          if possible_url and "http" in str(possible_url):
-            captured_hls_mbr = possible_url
-            print(f"[+] [JSON] Перехвачена ссылка: {captured_hls_mbr[:80]}...")
-
-        # Вариант 2: Прямой перехват запроса/редиректа с расширением .m3u8
-        elif ".m3u8" in url and not captured_hls_mbr:
-          captured_hls_mbr = url
-          print(
-              f"[+] [Direct M3U8] Перехвачена ссылка:"
-              f" {captured_hls_mbr[:80]}..."
-          )
-
+        content_type = response.headers.get("content-type", "").lower()
+        if (
+            "json" in content_type
+            or "mpegurl" in content_type
+            or "javascript" in content_type
+            or "stream" in url
+        ):
+          text = response.text()
+          inspect_url_and_body(url, text)
       except Exception:
         pass
 
+    def handle_websocket(ws):
+      """Слушаем WebSocket соединения на случай динамической передачи токена"""
+
+      def frame_received(frame):
+        global captured_hls_mbr
+        if frame:
+          inspect_url_and_body("ws_frame", str(frame))
+
+      ws.on("framereceived", frame_received)
+
     page.on("response", handle_response)
+    page.on("websocket", handle_websocket)
 
-    print(f"[*] Переходим на страницу {target_page}...")
-    page.goto(target_page, timeout=60000, wait_until="networkidle")
+    print(f"[*] Загрузка страницы: {target_page}...")
+    page.goto(target_page, timeout=60000, wait_until="domcontentloaded")
 
-    print("[*] Ожидаем инициализации плеера (8 сек)...")
-    time.sleep(8)
+    print("[*] Ожидаем появление элементов плеера...")
+    time.sleep(5)
 
-    # Если ссылка еще не поймана, делаем клики по области плеера
-    if not captured_hls_mbr:
+    # Кликаем конкретно по элементам плеера или видеокадра
+    selectors_to_click = [
+      "video",
+      ".vjs-tech",
+      ".player",
+      "#player",
+      "iframe",
+      "button",
+    ]
+    for selector in selectors_to_click:
+      if captured_hls_mbr:
+        break
       try:
-        print("[*] Клик по центру экрана для запуска вещания...")
-        page.mouse.click(640, 360)
-        time.sleep(5)
-      except Exception as e:
-        print(f"[!] Ошибка клика: {e}")
+        elem = page.query_selector(selector)
+        if elem:
+          print(f"[*] Клик по селектору: '{selector}'")
+          elem.click(timeout=2000)
+          time.sleep(3)
+      except Exception:
+        pass
+
+    # Пауза для завершения XHR запросов
+    if not captured_hls_mbr:
+      print("[*] Финальное ожидание ответов сети (7 сек)...")
+      time.sleep(7)
 
     browser.close()
     print("[*] Браузер закрыт.")
@@ -101,10 +159,16 @@ try:
 except Exception as e:
   print(f"[!] КРИТИЧЕСКАЯ ОШИБКА: {e}")
 
-# Отправка результатов
+# Диагностический вывод, если ничего не поймали
+if not captured_hls_mbr:
+  print("\n[-] Ссылка не найдена. Перехваченные API-запросы сервера:")
+  for u in all_api_urls[-15:]:
+    print(f"    {u}")
+
+# Отправка данных на Render
 if captured_hls_mbr and render_url:
   clean_render_url = render_url.rstrip("/")
-  print(f"[+] Отправка ссылки на Render ({clean_render_url})...")
+  print(f"\n[+] Отправка ссылки на Render ({clean_render_url})...")
   try:
     resp = requests.post(
         f"{clean_render_url}/update_link",
@@ -115,4 +179,7 @@ if captured_hls_mbr and render_url:
   except Exception as e:
     print(f"[!] Ошибка запроса к Render: {e}")
 else:
-  print("[-] ИТОГ: Ссылка не поймана или RENDER_URL не настроен.")
+  print(
+      "\n[-] ИТОГ: Ссылка не отправлена. Проверьте логи перехваченных запросов"
+      " выше."
+  )
