@@ -1,25 +1,24 @@
-import json
 import os
 import re
 import sys
 import time
 import requests
 
-print("[*] Старт обновленного скрипта update.py (v3)")
+print("[*] Старт скрипта update.py (с поддержкой Proxy)")
 render_url = os.environ.get("RENDER_URL")
+proxy_url = os.environ.get("PROXY_URL")
+
 target_page = "https://app.birge.tv/channels/1/irbis-tv"
 
 print(f"[*] Целевой адрес: {target_page}")
-print(
-    f"[*] RENDER_URL: {render_url if render_url else 'НЕ ЗАДАН (проверьте Secrets)'}"
-)
+print(f"[*] RENDER_URL задан: {'Да' if render_url else 'НЕТ'}")
+print(f"[*] PROXY_URL задан: {'Да (' + proxy_url + ')' if proxy_url else 'НЕТ'}")
 
 captured_hls_mbr = None
 all_api_urls = []
 
 
 def extract_m3u8_from_text(text):
-  """Поиск любой ссылки .m3u8 в тексте или JSON"""
   match = re.search(r"https?://[^\s\"'\\]+\.m3u8[^\s\"'\\]*", text)
   if match:
     return match.group(0).replace("\\/", "/")
@@ -31,21 +30,22 @@ try:
 
   print("[*] Инициализация Playwright...")
   with sync_playwright() as p:
-    # Запуск с аргументами, разрешающими автозапуск видео без жестких проверок браузера
-    browser = p.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--autoplay-policy=no-user-gesture-required",
-            "--no-first-run",
-            "--use-fake-ui-for-media-stream",
-        ],
-    )
+    # Настраиваем параметры запуска, включая прокси, если он задан
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--autoplay-policy=no-user-gesture-required",
+    ]
 
-    # Настраиваем размер экрана как у обычного десктопа
+    browser_config = {"headless": True, "args": launch_args}
+
+    if proxy_url:
+      browser_config["proxy"] = {"server": proxy_url}
+
+    browser = p.chromium.launch(**browser_config)
+
     context = browser.new_context(
         viewport={"width": 1920, "height": 1080},
         user_agent=(
@@ -55,29 +55,28 @@ try:
     )
     page = context.new_page()
 
+
     def inspect_url_and_body(url, body_text=""):
       global captured_hls_mbr
       if captured_hls_mbr:
         return
 
-      # 1. Прямой поиск .m3u8 в URL
       if ".m3u8" in url:
         captured_hls_mbr = url
         print(f"[+] [Direct M3U8 URL] Найдено: {captured_hls_mbr[:90]}")
         return
 
-      # 2. Поиск .m3u8 внутри тела ответа
       found_in_body = extract_m3u8_from_text(body_text)
       if found_in_body:
         captured_hls_mbr = found_in_body
         print(f"[+] [Extracted M3U8 Body] Найдено: {captured_hls_mbr[:90]}")
         return
 
+
     def handle_response(response):
       global captured_hls_mbr
       url = response.url
 
-      # Фильтруем статические ресурсы
       if any(
           ext in url
           for ext in [
@@ -108,47 +107,31 @@ try:
       except Exception:
         pass
 
-    def handle_websocket(ws):
-      """Слушаем WebSocket соединения на случай динамической передачи токена"""
-
-      def frame_received(frame):
-        global captured_hls_mbr
-        if frame:
-          inspect_url_and_body("ws_frame", str(frame))
-
-      ws.on("framereceived", frame_received)
 
     page.on("response", handle_response)
-    page.on("websocket", handle_websocket)
 
-    print(f"[*] Загрузка страницы: {target_page}...")
-    page.goto(target_page, timeout=60000, wait_until="domcontentloaded")
+    print(f"[*] Загрузка страницы через прокси: {target_page}...")
+    try:
+      page.goto(target_page, timeout=60000, wait_until="domcontentloaded")
+    except Exception as e:
+      print(
+          "[!] Ошибка загрузки (возможно, прокси недоступен или лежит):"
+          f" {e}"
+      )
 
     print("[*] Ожидаем появление элементов плеера...")
-    time.sleep(5)
+    time.sleep(6)
 
-    # Кликаем конкретно по элементам плеера или видеокадра
-    selectors_to_click = [
-      "video",
-      ".vjs-tech",
-      ".player",
-      "#player",
-      "iframe",
-      "button",
-    ]
-    for selector in selectors_to_click:
-      if captured_hls_mbr:
-        break
-      try:
-        elem = page.query_selector(selector)
-        if elem:
-          print(f"[*] Клик по селектору: '{selector}'")
-          elem.click(timeout=2000)
-          time.sleep(3)
-      except Exception:
-        pass
+    # Кликаем по плееру для инициализации потока
+    try:
+      elem = page.query_selector("video") or page.query_selector("button")
+      if elem:
+        print("[*] Клик по элементу плеера/кнопке...")
+        elem.click(timeout=2000)
+        time.sleep(4)
+    except Exception:
+      pass
 
-    # Пауза для завершения XHR запросов
     if not captured_hls_mbr:
       print("[*] Финальное ожидание ответов сети (7 сек)...")
       time.sleep(7)
@@ -157,15 +140,14 @@ try:
     print("[*] Браузер закрыт.")
 
 except Exception as e:
-  print(f"[!] КРИТИЧЕСКАЯ ОШИБКА: {e}")
+  print(f"[!] КРИТИЧЕСКАЯ ОШИБКА PLAYWRIGHT: {e}")
 
-# Диагностический вывод, если ничего не поймали
 if not captured_hls_mbr:
-  print("\n[-] Ссылка не найдена. Перехваченные API-запросы сервера:")
+  print("\n[-] Ссылка не найдена. Последние запросы:")
   for u in all_api_urls[-15:]:
     print(f"    {u}")
 
-# Отправка данных на Render
+# Отправка на Render
 if captured_hls_mbr and render_url:
   clean_render_url = render_url.rstrip("/")
   print(f"\n[+] Отправка ссылки на Render ({clean_render_url})...")
@@ -179,7 +161,4 @@ if captured_hls_mbr and render_url:
   except Exception as e:
     print(f"[!] Ошибка запроса к Render: {e}")
 else:
-  print(
-      "\n[-] ИТОГ: Ссылка не отправлена. Проверьте логи перехваченных запросов"
-      " выше."
-  )
+  print("\n[-] ИТОГ: Ссылка не отправлена.")
